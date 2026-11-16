@@ -48,24 +48,19 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
 
 
 def apply_rotary_emb_causal(
-    xq: torch.Tensor, 
-    xk: torch.Tensor, 
-    freqs_cis: torch.Tensor, 
-    start_pos: int = 0
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis_n: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-
+    """freqs_cis_n is already sliced to the current sequence window.
+    Caller pre-slices outside the compile boundary so start_pos never
+    reaches dynamo, avoiding per-int-value graph specialization."""
     B, H, N, D = xq.shape
-    
-    end_pos = start_pos + N
-    if end_pos > freqs_cis.shape[0]:
-        raise ValueError(f"Required position {end_pos} exceeds precomputed max length {freqs_cis.shape[0]}.")
-        
-    freqs_cis_n = freqs_cis[start_pos:end_pos, :].to(xq.device)
-    freqs_cis_n = freqs_cis_n.view(1, 1, N, -1) # [1, 1, N, D/2]
+    freqs_cis_n = freqs_cis_n.to(xq.device).view(1, 1, N, -1)
 
     xq_ = xq.float().reshape(B, H, N, D // 2, 2)
     xk_ = xk.float().reshape(B, H, N, D // 2, 2)
-    
+
     xq_comp = torch.view_as_complex(xq_)
     xk_comp = torch.view_as_complex(xk_)
 
@@ -78,10 +73,9 @@ def apply_rotary_emb_causal(
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
-def apply_rotary_emb_q(xq: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+def apply_rotary_emb_q(xq: torch.Tensor, freqs_cis_n: torch.Tensor) -> torch.Tensor:
     B, H, N, D = xq.shape
-    end_pos = start_pos + N
-    freqs_cis_n = freqs_cis[start_pos:end_pos, :].view(1, 1, N, -1)
+    freqs_cis_n = freqs_cis_n.view(1, 1, N, -1)
     xq_ = xq.float().reshape(B, H, N, D // 2, 2)
     xq_comp = torch.view_as_complex(xq_)
     xq_rotated_comp = xq_comp * freqs_cis_n
@@ -89,10 +83,9 @@ def apply_rotary_emb_q(xq: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int
     return xq_out.type_as(xq)
 
 
-def apply_rotary_emb_k(xk: torch.Tensor, freqs_cis: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+def apply_rotary_emb_k(xk: torch.Tensor, freqs_cis_n: torch.Tensor) -> torch.Tensor:
     B, H, N, D = xk.shape
-    end_pos = start_pos + N
-    freqs_cis_n = freqs_cis[start_pos:end_pos, :].view(1, 1, N, -1)
+    freqs_cis_n = freqs_cis_n.view(1, 1, N, -1)
     xk_ = xk.float().reshape(B, H, N, D // 2, 2)
     xk_comp = torch.view_as_complex(xk_)
     xk_rotated_comp = xk_comp * freqs_cis_n
@@ -185,7 +178,7 @@ class CrossAttention(nn.Module):
         return mask
 
 
-    def forward(self, x: torch.Tensor, c: torch.Tensor, mask: torch.Tensor = None, kv_cache = None, update_kv_cache=False, start_pos: int = 0) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, c: torch.Tensor, mask: torch.Tensor = None, kv_cache = None, update_kv_cache=False) -> torch.Tensor:
         B, N, C = x.shape
         Nc = c.shape[1]
         q = self.q(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
@@ -267,16 +260,16 @@ class Attention(nn.Module):
         self.apply_rotary_emb = apply_rotary_emb_causal
 
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, start_pos:int = 0, kv_cache=None, update_kv_cache=False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None, freqs_cis_slice: torch.Tensor = None, kv_cache=None, update_kv_cache=False) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k_new, v_new = qkv.unbind(0)
 
-        q = self.q_norm(q) 
+        q = self.q_norm(q)
         k_new = self.k_norm(k_new)
-        
-        q = apply_rotary_emb_q(q, self.freqs_cis, start_pos=start_pos) # 12
-        k_new = apply_rotary_emb_k(k_new, self.freqs_cis, start_pos=start_pos)
+
+        q = apply_rotary_emb_q(q, freqs_cis_slice)
+        k_new = apply_rotary_emb_k(k_new, freqs_cis_slice)
 
         if kv_cache is not None:
             if k_new.shape[2] == self.num_frames_per_block + 2:
@@ -339,7 +332,7 @@ class DFoTBlock(nn.Module):
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.cross_attn = CrossAttention(hidden_size, num_heads=num_heads, qkv_bias=True, num_frames_for_clip=num_frames_for_clip, num_frames_per_block=num_frames_per_block, **block_kwargs)
 
-    def forward(self, x, scale_shift_alpha, c, mask=None, cross_mask=None, start_pos=0, kv_cache=None, update_kv_cache=False) -> torch.Tensor:
+    def forward(self, x, scale_shift_alpha, c, mask=None, cross_mask=None, freqs_cis_slice: torch.Tensor = None, kv_cache=None, update_kv_cache=False) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = scale_shift_alpha
 
         self_kv_cache  = kv_cache[0] if kv_cache is not None else None
@@ -347,17 +340,16 @@ class DFoTBlock(nn.Module):
 
         x_attn = self.attn(
             modulate(self.norm1(x), shift_msa, scale_msa),
-            mask            = mask,
-            start_pos       = start_pos,
-            kv_cache        = self_kv_cache,
-            update_kv_cache = update_kv_cache)
+            mask             = mask,
+            freqs_cis_slice  = freqs_cis_slice,
+            kv_cache         = self_kv_cache,
+            update_kv_cache  = update_kv_cache)
         x = x + gate_msa * x_attn
 
         x_cross = self.cross_attn(
             self.norm3(x),
             c               = c,
             mask            = cross_mask,
-            start_pos       = start_pos,
             kv_cache        = cross_kv_cache,
             update_kv_cache = update_kv_cache)
 
@@ -485,36 +477,41 @@ class FlowTransformer(BaseModel):
         motion_user = self.sequence_embedder(motion_user, dropout_prob = self.opt.audio_dropout_prob, train=train)
         c           = self.c_embedder(wa_user, motion_user, wa)
 
+        # Pull the RoPE slice for this window outside the attention stack so the
+        # start_pos integer never crosses the torch.compile boundary.
+        N = x.shape[1]
+        freqs_cis_slice = self.blocks[0].attn.freqs_cis.narrow(0, start_pos, N)
+
         for i, block in enumerate(self.blocks):
-            attn_kv_cache = kv_cache_list[i] if kv_cache_list is not None else None 
+            attn_kv_cache = kv_cache_list[i] if kv_cache_list is not None else None
             x = block(
                 x                 = x,
                 scale_shift_alpha = shared_scale_shift_alpha,
                 c                 = c,
                 mask              = self.block_bidir_causal_lookahead_mask,
                 cross_mask        = self.alignment_mask,
-                start_pos         = start_pos,
+                freqs_cis_slice   = freqs_cis_slice,
                 kv_cache          = attn_kv_cache,
                 update_kv_cache   = update_kv_cache)  # (N, T, D)
 
         return self.final_layer(x, t_embed)
 
 
-    def forward_with_precomputed(self, x, precomputed_c, precomputed_adaLN, precomputed_wr, start_pos, kv_cache_list, update_kv_cache):
+    def forward_with_precomputed(self, x, precomputed_c, precomputed_adaLN, precomputed_wr, freqs_cis_slice, kv_cache_list, update_kv_cache):
         shared_scale_shift_alpha, t_embed, final_adaLN = precomputed_adaLN
 
         x = torch.cat([x, precomputed_wr], dim=-1)
         x = self.x_embedder(x)
 
         for i, block in enumerate(self.blocks):
-            attn_kv_cache = kv_cache_list[i] if kv_cache_list is not None else None 
+            attn_kv_cache = kv_cache_list[i] if kv_cache_list is not None else None
             x = block(
                 x                 = x,
                 scale_shift_alpha = shared_scale_shift_alpha,
                 c                 = precomputed_c,
                 mask              = self.block_bidir_causal_lookahead_mask,
                 cross_mask        = self.alignment_mask,
-                start_pos         = start_pos,
+                freqs_cis_slice   = freqs_cis_slice,
                 kv_cache          = attn_kv_cache,
                 update_kv_cache   = update_kv_cache)  # (N, T, D)
 

@@ -1,4 +1,4 @@
-import os, copy, pickle, torch, yaml, random, json, cv2, torchvision, subprocess, argparse, uuid, datetime, tempfile, librosa, face_alignment
+import os, copy, pickle, torch, yaml, random, json, cv2, torchvision, subprocess, argparse, uuid, datetime, tempfile, librosa, face_alignment, time
 
 import numpy as np
 import pandas as pd
@@ -120,9 +120,41 @@ class InferenceAgent:
         from models.avatarforcing.AvatarForcing import AvatarForcing
 
         self.G = AvatarForcing(self.opt).to(self.rank)
-        self.load_mae_ckpt(opt.mae_ckpt_path, rank=self.rank)
-        self.load_ckpt(opt.ckpt_path, rank = self.rank)
+        self.load_mae_ckpt(self.opt.mae_ckpt_path, rank=self.rank)
+        self.load_ckpt(self.opt.ckpt_path, rank = self.rank)
         self.G.eval()
+        # Inference-only — kill requires_grad so dynamo/inductor doesn't try
+        # to trace a backward for ops like _scaled_mm (which has no autograd).
+        for p in self.G.parameters():
+            p.requires_grad_(False)
+
+        # Optional FP8 quantization for Blackwell/Hopper tensor cores.
+        # Dynamic (per-tensor-dynamic scaling) — no calibration needed, no
+        # checkpoint changes, can be disabled by setting AF_FP8=0. Applied
+        # BEFORE torch.compile so the compiler sees the quantized ops.
+        if os.environ.get("AF_FP8", "0") == "1":
+            try:
+                from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+                # _scaled_mm on Blackwell requires bias in bf16/fp16 — cast
+                # the module first so torchao's replacement finds bf16 biases.
+                # Skipping the motion_autoencoder decoder: it uses
+                # torch.linalg.qr which has no bf16 kernel. Flow_transformer
+                # is the bigger cost anyway so this is still a big win.
+                self.G.flow_transformer.to(torch.bfloat16)
+                cfg = Float8DynamicActivationFloat8WeightConfig()
+                print("> FP8 quantize: flow_transformer")
+                quantize_(self.G.flow_transformer, cfg)
+            except Exception as e:
+                print(f"> FP8 quantize failed, falling back to BF16: {e}")
+
+        if getattr(self.opt, "compile", False):
+            print("> torch.compile: wrapping flow_transformer.forward_with_precomputed and motion_autoencoder.dec")
+            self.G.flow_transformer.forward_with_precomputed = torch.compile(
+                self.G.flow_transformer.forward_with_precomputed,
+                mode="default", dynamic=True, fullgraph=False)
+            self.G.motion_autoencoder.dec = torch.compile(
+                self.G.motion_autoencoder.dec,
+                mode="default", dynamic=False, fullgraph=False)
 
     def load_ckpt(self, ckpt_path, rank):
         state_dict = torch.load(ckpt_path, map_location='cuda:{}'.format(rank), weights_only=True)
@@ -141,6 +173,98 @@ class InferenceAgent:
             print(f"> Loaded Motion Latent Autoencoder from: {mae_ckpt_path}")
 
     @torch.no_grad()
+    def run_stream(
+        self,
+        avatar_ref_path: str,
+        avatar_audio_path: str,
+        user_audio_path: str,
+        user_video_path: str,
+        a_cfg_scale: float    = 2.0,
+        u_cfg_scale: float    = 1.0,
+        nfe: int              = 10,
+        seed: int             = 25
+    ) -> None:
+        """Streaming path: emits blocks as they are generated, pipes to ffmpeg."""
+        t0 = time.perf_counter()
+        data = self.data_processor.preprocess(
+                avatar_ref_path   = avatar_ref_path,
+                avatar_audio_path = avatar_audio_path,
+                user_audio_path   = user_audio_path,
+                user_video_path   = user_video_path
+        )
+        torch.cuda.synchronize()
+        t_pre = time.perf_counter() - t0
+
+        avatar_name = os.path.basename(avatar_ref_path).split(".")[0]
+        res_video_path = os.path.join(self.opt.result_dir, f"{avatar_name}-stream-seed{seed}-{uuid.uuid4().hex[:10]}.mp4")
+
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tv:
+            temp_filename = tv.name
+        W = H = self.opt.input_size
+        fps = self.opt.fps
+        ff = subprocess.Popen(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "rgb24",
+             "-s", f"{W}x{H}", "-r", str(fps),
+             "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             temp_filename],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        block_latencies = []
+        first_block_lat = None
+        t_gen_start = time.perf_counter()
+        total_frames = 0
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for block_idx, pixels, is_last in self.G.inference_stream(
+                data         = data,
+                a_cfg_scale  = a_cfg_scale,
+                u_cfg_scale  = u_cfg_scale,
+                nfe          = nfe,
+                seed         = seed,
+            ):
+                torch.cuda.synchronize()
+                t_now = time.perf_counter()
+                if first_block_lat is None:
+                    first_block_lat = t_now - t_gen_start
+                block_latencies.append(t_now)
+
+                # [1, k, 3, H, W] -> [k, H, W, 3] uint8 raw rgb
+                vid = pixels.squeeze(0).detach().clamp(-1, 1).cpu()
+                vid = ((vid - vid.min()) / (vid.max() - vid.min() + 1e-8) * 255.0)
+                vid = vid.permute(0, 2, 3, 1).contiguous().to(torch.uint8)
+                ff.stdin.write(vid.numpy().tobytes())
+                total_frames += vid.shape[0]
+
+        ff.stdin.close()
+        ff.wait()
+        t_gen = time.perf_counter() - t_gen_start
+
+        # Mux audio
+        with open(os.devnull, 'wb') as devnull:
+            subprocess.call(
+                ["ffmpeg", "-y", "-i", temp_filename, "-i", avatar_audio_path,
+                 "-shortest", "-vcodec", "copy", "-acodec", "aac",
+                 res_video_path],
+                stdout=devnull, stderr=devnull)
+            if os.path.exists(res_video_path):
+                os.remove(temp_filename)
+
+        # Per-block deltas (block N+1 time - block N time)
+        if len(block_latencies) >= 2:
+            per_block_ms = [(block_latencies[i] - block_latencies[i - 1]) * 1000 for i in range(1, len(block_latencies))]
+            med = sorted(per_block_ms)[len(per_block_ms) // 2]
+            mn, mx = min(per_block_ms), max(per_block_ms)
+        else:
+            med = mn = mx = 0.0
+
+        clip_sec = total_frames / float(fps)
+        rtf = t_gen / clip_sec if clip_sec > 0 else 0.0
+        print(f"[stream] preprocess={t_pre:.2f}s  generate={t_gen:.2f}s  clip={clip_sec:.2f}s  RTF={rtf:.2f}x  frames={total_frames}")
+        print(f"[stream] first-block-latency={first_block_lat*1000:.1f}ms  per-block median/min/max = {med:.1f} / {mn:.1f} / {mx:.1f} ms")
+        print(f"[stream] output: {res_video_path}")
+
+    @torch.no_grad()
     def run_inference(
         self,
         avatar_ref_path: str,
@@ -153,13 +277,17 @@ class InferenceAgent:
         seed: int             = 25
     ) -> None:
 
+        t0 = time.perf_counter()
         data = self.data_processor.preprocess(
                 avatar_ref_path   = avatar_ref_path,
                 avatar_audio_path = avatar_audio_path,
                 user_audio_path   = user_audio_path,
                 user_video_path   = user_video_path
         )
+        torch.cuda.synchronize()
+        t_pre = time.perf_counter() - t0
 
+        t1 = time.perf_counter()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             d_hat = self.G.inference(
                 data          = data,
@@ -169,10 +297,19 @@ class InferenceAgent:
                 seed          = seed,
                 use_kv_cache  = True
             )['d_hat']
+        torch.cuda.synchronize()
+        t_gen = time.perf_counter() - t1
 
+        t2 = time.perf_counter()
         avatar_name = os.path.basename(avatar_ref_path).split(".")[0]
         res_video_path = os.path.join(self.opt.result_dir, f"{avatar_name}-seed{seed}-{uuid.uuid4().hex[:10]}.mp4")
         self.save_video(d_hat, res_video_path, avatar_audio_path)
+        t_mux = time.perf_counter() - t2
+
+        clip_sec = float(d_hat.shape[0]) / float(self.opt.fps)
+        rtf = t_gen / clip_sec if clip_sec > 0 else 0.0
+        print(f"[timing] preprocess={t_pre:.2f}s  generate={t_gen:.2f}s  save={t_mux:.2f}s  "
+              f"clip={clip_sec:.2f}s  RTF={rtf:.2f}x  (frames={d_hat.shape[0]}, nfe={nfe}, compile={getattr(self.opt, 'compile', False)})")
 
     def save_video(self, vid_target_recon:torch.Tensor, video_path:str, audio_path:str) -> str:
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete = False) as temp_video:
@@ -180,7 +317,17 @@ class InferenceAgent:
             vid = vid_target_recon.permute(0, 2, 3, 1)
             vid = vid.detach().clamp(-1, 1).cpu()
             vid = ((vid - vid.min()) / (vid.max() - vid.min()) * 255).type('torch.ByteTensor')
-            torchvision.io.write_video(temp_filename, vid, fps=self.opt.fps)			
+            T, H, W, C = vid.shape
+            ff = subprocess.Popen(
+                ["ffmpeg", "-y", "-loglevel", "error",
+                 "-f", "rawvideo", "-pix_fmt", "rgb24",
+                 "-s", f"{W}x{H}", "-r", str(self.opt.fps),
+                 "-i", "-", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 temp_filename],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ff.stdin.write(vid.numpy().tobytes())
+            ff.stdin.close()
+            ff.wait()
             
             if audio_path is not None: # add audio to video
                 with open(os.devnull, 'wb') as f:
@@ -225,7 +372,15 @@ def inference_args():
     # guidance scales
     parser.add_argument('--a_cfg_scale', type=float, default = 2)
     parser.add_argument('--u_cfg_scale', type=float, default = 1)
-            
+
+    # optimizations
+    parser.add_argument('--compile', action='store_true',
+            help='Enable torch.compile on flow_transformer and motion_autoencoder.dec')
+    parser.add_argument('--warmup', type=int, default=0,
+            help='Number of warmup runs before the timed run (useful with --compile)')
+    parser.add_argument('--stream', action='store_true',
+            help='Use streaming (block-by-block) path (Phase A).')
+
     return parser.parse_args()
 
 
@@ -252,7 +407,21 @@ if __name__ == '__main__':
     agent = InferenceAgent(opt)
     os.makedirs(opt.result_dir, exist_ok = True)
 
-    agent.run_inference(
+    run_fn = agent.run_stream if getattr(opt, "stream", False) else agent.run_inference
+
+    for w in range(getattr(opt, "warmup", 0)):
+        print(f"> warmup run {w+1}/{opt.warmup}")
+        run_fn(
+            avatar_ref_path   = opt.avatar_ref_path,
+            avatar_audio_path = opt.avatar_audio_path,
+            user_audio_path   = opt.user_audio_path,
+            user_video_path   = opt.user_video_path,
+            a_cfg_scale       = opt.a_cfg_scale,
+            u_cfg_scale       = opt.u_cfg_scale,
+            nfe               = opt.nfe,
+        )
+
+    run_fn(
         avatar_ref_path   = opt.avatar_ref_path,
         avatar_audio_path = opt.avatar_audio_path,
         user_audio_path   = opt.user_audio_path,
