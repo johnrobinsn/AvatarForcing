@@ -148,13 +148,17 @@ class InferenceAgent:
                 print(f"> FP8 quantize failed, falling back to BF16: {e}")
 
         if getattr(self.opt, "compile", False):
-            print("> torch.compile: wrapping flow_transformer.forward_with_precomputed and motion_autoencoder.dec")
+            # AF_COMPILE_MODE: "default" (baseline) or "reduce-overhead" (CUDA graphs).
+            # reduce-overhead wraps compiled regions in CUDA graphs, which cuts
+            # kernel-launch overhead but requires static shapes per graph.
+            compile_mode = os.environ.get("AF_COMPILE_MODE", "reduce-overhead")
+            print(f"> torch.compile: wrapping flow_transformer.forward_with_precomputed and motion_autoencoder.dec (mode={compile_mode})")
             self.G.flow_transformer.forward_with_precomputed = torch.compile(
                 self.G.flow_transformer.forward_with_precomputed,
-                mode="default", dynamic=True, fullgraph=False)
+                mode=compile_mode, dynamic=True, fullgraph=False)
             self.G.motion_autoencoder.dec = torch.compile(
                 self.G.motion_autoencoder.dec,
-                mode="default", dynamic=False, fullgraph=False)
+                mode=compile_mode, dynamic=False, fullgraph=False)
 
     def load_ckpt(self, ckpt_path, rank):
         state_dict = torch.load(ckpt_path, map_location='cuda:{}'.format(rank), weights_only=True)
