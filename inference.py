@@ -151,14 +151,22 @@ class InferenceAgent:
             # AF_COMPILE_MODE: "default" (baseline) or "reduce-overhead" (CUDA graphs).
             # reduce-overhead wraps compiled regions in CUDA graphs, which cuts
             # kernel-launch overhead but requires static shapes per graph.
+            # AF_MAE_COMPILE_MODE lets the motion autoencoder decoder use a
+            # different mode from the flow transformer. The MAE is called 1x
+            # per block (vs ~20x for the flow transformer), so the CUDA graph
+            # pool it reserves (for large pixel-tensor outputs) buys less
+            # perf per GB than the flow transformer's pool. Downgrading MAE
+            # to "default" is a VRAM/perf tradeoff worth exploring on cards
+            # with tight VRAM budgets.
             compile_mode = os.environ.get("AF_COMPILE_MODE", "reduce-overhead")
-            print(f"> torch.compile: wrapping flow_transformer.forward_with_precomputed and motion_autoencoder.dec (mode={compile_mode})")
+            mae_compile_mode = os.environ.get("AF_MAE_COMPILE_MODE", compile_mode)
+            print(f"> torch.compile: flow_transformer.forward_with_precomputed (mode={compile_mode}), motion_autoencoder.dec (mode={mae_compile_mode})")
             self.G.flow_transformer.forward_with_precomputed = torch.compile(
                 self.G.flow_transformer.forward_with_precomputed,
                 mode=compile_mode, dynamic=True, fullgraph=False)
             self.G.motion_autoencoder.dec = torch.compile(
                 self.G.motion_autoencoder.dec,
-                mode=compile_mode, dynamic=False, fullgraph=False)
+                mode=mae_compile_mode, dynamic=False, fullgraph=False)
 
     def load_ckpt(self, ckpt_path, rank):
         state_dict = torch.load(ckpt_path, map_location='cuda:{}'.format(rank), weights_only=True)
