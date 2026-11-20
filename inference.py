@@ -25,25 +25,49 @@ from transformers import Wav2Vec2FeatureExtractor
 # the artifact with scripts/compile_aot.py (one-shot, ~40s per GPU model).
 _AOTI_STEADY_N = 12
 
+def _aoti_cache_dir() -> Path:
+    override = os.environ.get("AF_AOTI_DIR")
+    return Path(override) if override else Path(__file__).resolve().parent.parent / "compiled_models"
+
 def _aoti_cache_path() -> Path:
     cap = torch.cuda.get_device_capability(0)
-    override = os.environ.get("AF_AOTI_DIR")
-    base = Path(override) if override else Path(__file__).resolve().parent.parent / "compiled_models"
-    return base / f"flow_transformer_sm{cap[0]}{cap[1]}_n12.pt2"
+    return _aoti_cache_dir() / f"flow_transformer_sm{cap[0]}{cap[1]}_n12.pt2"
 
-def _try_load_aoti():
-    path = _aoti_cache_path()
+def _mae_aoti_cache_path() -> Path:
+    cap = torch.cuda.get_device_capability(0)
+    return _aoti_cache_dir() / f"mae_decoder_sm{cap[0]}{cap[1]}.pt2"
+
+def _try_load_aoti_file(path: Path, kind: str):
     if not path.exists():
         return None
     try:
         from torch._inductor import aoti_load_package
         t0 = time.perf_counter()
         handle = aoti_load_package(str(path))
-        print(f"> AOTInductor: loaded {path.name} in {time.perf_counter() - t0:.1f}s ({path.stat().st_size // (1024*1024)} MB)")
+        print(f"> AOTInductor: loaded {kind} from {path.name} in {time.perf_counter() - t0:.1f}s ({path.stat().st_size // (1024*1024)} MB)")
         return handle
     except Exception as e:
         print(f"> AOTInductor: failed to load {path} ({type(e).__name__}: {e}); falling back to torch.compile")
         return None
+
+def _try_load_aoti():
+    return _try_load_aoti_file(_aoti_cache_path(), "flow_transformer")
+
+def _try_load_mae_aoti():
+    return _try_load_aoti_file(_mae_aoti_cache_path(), "mae_decoder")
+
+def _make_mae_aoti_shim(aoti_handle, eager_fallback):
+    """Wrap an AOTI-loaded MAE decoder callable so it preserves the original
+    `dec(wa, alpha, feats) -> (img, extras)` API. The compiled artifact only
+    accepts (wa, feats_tuple) with alpha=None and fp32 inputs; anything else
+    falls back to eager (shouldn't happen in the live pipeline)."""
+    def shim(wa, alpha=None, feats=None):
+        if alpha is None and feats is not None:
+            img = aoti_handle(wa.to(torch.float32),
+                              tuple(f.to(torch.float32) for f in feats))
+            return img, None
+        return eager_fallback(wa, alpha, feats)
+    return shim
 
 def _make_aoti_shim(aoti_handle, eager_fallback):
     """Wrap an AOTI-loaded callable so it preserves the original
@@ -239,10 +263,16 @@ class InferenceAgent:
                     self.G.flow_transformer.forward_with_precomputed,
                     mode=compile_mode, dynamic=True, fullgraph=False)
 
-            print(f"> torch.compile: motion_autoencoder.dec (mode={mae_compile_mode})")
-            self.G.motion_autoencoder.dec = torch.compile(
-                self.G.motion_autoencoder.dec,
-                mode=mae_compile_mode, dynamic=False, fullgraph=False)
+            mae_aoti = _try_load_mae_aoti() if os.environ.get("AF_AOTI", "1") == "1" else None
+            if mae_aoti is not None:
+                print(f"> AOTInductor: using prebuilt motion_autoencoder.dec")
+                dec_orig = self.G.motion_autoencoder.dec.forward
+                self.G.motion_autoencoder.dec.forward = _make_mae_aoti_shim(mae_aoti, dec_orig)
+            else:
+                print(f"> torch.compile: motion_autoencoder.dec (mode={mae_compile_mode})")
+                self.G.motion_autoencoder.dec = torch.compile(
+                    self.G.motion_autoencoder.dec,
+                    mode=mae_compile_mode, dynamic=False, fullgraph=False)
 
     def load_ckpt(self, ckpt_path, rank):
         state_dict = torch.load(ckpt_path, map_location='cuda:{}'.format(rank), weights_only=True)
