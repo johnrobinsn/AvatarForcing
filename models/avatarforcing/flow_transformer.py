@@ -39,12 +39,40 @@ def make_block_bidir_causal_lookahead_mask_window(start_pos: int, cache_len: int
     return allow
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    """Precompute concatenated [cos, sin] RoPE table (real-valued).
+
+    Returns tensor of shape [end, dim] where the first dim/2 channels hold
+    cos(theta_i) and the last dim/2 channels hold sin(theta_i). Previously
+    this returned a complex polar tensor of shape [end, dim/2]; the complex
+    view_as_complex/view_as_real idiom is not reliably supported by
+    AOTInductor, so we store the (cos, sin) pair as a real tensor and do
+    the rotary multiply as two real multiplies. Mathematically equivalent.
+    """
     if dim % 2 != 0:
         raise ValueError("RoPE dim must be even.")
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))    
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end)
-    freqs = torch.outer(t, freqs).float()    
-    return torch.polar(torch.ones_like(freqs), freqs) # [end, dim/2]
+    freqs = torch.outer(t, freqs).float()      # [end, dim/2]
+    return torch.cat([freqs.cos(), freqs.sin()], dim=-1)  # [end, dim]
+
+
+def _apply_rotary(x: torch.Tensor, freqs_cis_n: torch.Tensor) -> torch.Tensor:
+    """Real-valued rotary rotation. freqs_cis_n is [N, D] (cos||sin concat).
+
+    Treats the last dim of x as D/2 (real, imag) pairs and multiplies by
+    cos+i*sin, i.e. (a + bi)(cos + i*sin) = (a*cos - b*sin) + i*(a*sin + b*cos).
+    """
+    B, H, N, D = x.shape
+    half = D // 2
+    cos_n = freqs_cis_n[:, :half].view(1, 1, N, half)
+    sin_n = freqs_cis_n[:, half:].view(1, 1, N, half)
+    x_pair = x.float().reshape(B, H, N, half, 2)
+    x_real = x_pair[..., 0]
+    x_imag = x_pair[..., 1]
+    out_real = x_real * cos_n - x_imag * sin_n
+    out_imag = x_real * sin_n + x_imag * cos_n
+    out = torch.stack([out_real, out_imag], dim=-1).flatten(3)
+    return out.type_as(x)
 
 
 def apply_rotary_emb_causal(
@@ -55,42 +83,15 @@ def apply_rotary_emb_causal(
     """freqs_cis_n is already sliced to the current sequence window.
     Caller pre-slices outside the compile boundary so start_pos never
     reaches dynamo, avoiding per-int-value graph specialization."""
-    B, H, N, D = xq.shape
-    freqs_cis_n = freqs_cis_n.to(xq.device).view(1, 1, N, -1)
-
-    xq_ = xq.float().reshape(B, H, N, D // 2, 2)
-    xk_ = xk.float().reshape(B, H, N, D // 2, 2)
-
-    xq_comp = torch.view_as_complex(xq_)
-    xk_comp = torch.view_as_complex(xk_)
-
-    xq_rotated_comp = xq_comp * freqs_cis_n
-    xk_rotated_comp = xk_comp * freqs_cis_n
-
-    xq_out = torch.view_as_real(xq_rotated_comp).flatten(3)
-    xk_out = torch.view_as_real(xk_rotated_comp).flatten(3)
-
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+    return _apply_rotary(xq, freqs_cis_n), _apply_rotary(xk, freqs_cis_n)
 
 
 def apply_rotary_emb_q(xq: torch.Tensor, freqs_cis_n: torch.Tensor) -> torch.Tensor:
-    B, H, N, D = xq.shape
-    freqs_cis_n = freqs_cis_n.view(1, 1, N, -1)
-    xq_ = xq.float().reshape(B, H, N, D // 2, 2)
-    xq_comp = torch.view_as_complex(xq_)
-    xq_rotated_comp = xq_comp * freqs_cis_n
-    xq_out = torch.view_as_real(xq_rotated_comp).flatten(3)
-    return xq_out.type_as(xq)
+    return _apply_rotary(xq, freqs_cis_n)
 
 
 def apply_rotary_emb_k(xk: torch.Tensor, freqs_cis_n: torch.Tensor) -> torch.Tensor:
-    B, H, N, D = xk.shape
-    freqs_cis_n = freqs_cis_n.view(1, 1, N, -1)
-    xk_ = xk.float().reshape(B, H, N, D // 2, 2)
-    xk_comp = torch.view_as_complex(xk_)
-    xk_rotated_comp = xk_comp * freqs_cis_n
-    xk_out = torch.view_as_real(xk_rotated_comp).flatten(3)
-    return xk_out.type_as(xk)
+    return _apply_rotary(xk, freqs_cis_n)
 
 
 
