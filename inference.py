@@ -63,8 +63,15 @@ def _make_mae_aoti_shim(aoti_handle, eager_fallback):
     falls back to eager (shouldn't happen in the live pipeline)."""
     def shim(wa, alpha=None, feats=None):
         if alpha is None and feats is not None:
-            img = aoti_handle(wa.to(torch.float32),
-                              tuple(f.to(torch.float32) for f in feats))
+            # Disable autocast inside the AOTI call. The compiled graph bakes
+            # in fp32 dtypes; running it under autocast(bf16) causes cudnn
+            # convolutions to dispatch to a bf16 path that doesn't match the
+            # compiled artifact's expectations and crashes with illegal
+            # memory access.
+            with torch.autocast(device_type="cuda", enabled=False):
+                wa_c = wa.to(torch.float32).contiguous()
+                feats_c = tuple(f.to(torch.float32).contiguous() for f in feats)
+                img = aoti_handle(wa_c, feats_c)
             return img, None
         return eager_fallback(wa, alpha, feats)
     return shim
