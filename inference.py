@@ -15,6 +15,63 @@ from pathlib import Path
 from omegaconf import OmegaConf
 from transformers import Wav2Vec2FeatureExtractor
 
+
+# ---------- AOTInductor cache helpers ----------
+# The steady-state read-only forward_with_precomputed path (update_kv_cache=False,
+# N = num_frames_per_block + 2 = 12) is the 20x-per-block hot path. If a
+# prebuilt AOTInductor .pt2 artifact for the current GPU is available at
+# <AF_AOTI_DIR or AvatarVoice/compiled_models>/flow_transformer_sm<cap>_n12.pt2,
+# we load it here instead of calling torch.compile. First-time users build
+# the artifact with scripts/compile_aot.py (one-shot, ~40s per GPU model).
+_AOTI_STEADY_N = 12
+
+def _aoti_cache_path() -> Path:
+    cap = torch.cuda.get_device_capability(0)
+    override = os.environ.get("AF_AOTI_DIR")
+    base = Path(override) if override else Path(__file__).resolve().parent.parent / "compiled_models"
+    return base / f"flow_transformer_sm{cap[0]}{cap[1]}_n12.pt2"
+
+def _try_load_aoti():
+    path = _aoti_cache_path()
+    if not path.exists():
+        return None
+    try:
+        from torch._inductor import aoti_load_package
+        t0 = time.perf_counter()
+        handle = aoti_load_package(str(path))
+        print(f"> AOTInductor: loaded {path.name} in {time.perf_counter() - t0:.1f}s ({path.stat().st_size // (1024*1024)} MB)")
+        return handle
+    except Exception as e:
+        print(f"> AOTInductor: failed to load {path} ({type(e).__name__}: {e}); falling back to torch.compile")
+        return None
+
+def _make_aoti_shim(aoti_handle, eager_fallback):
+    """Wrap an AOTI-loaded callable so it preserves the original
+    forward_with_precomputed 7-arg API. Routes the steady-state read-only
+    path (N=12, update_kv_cache=False) to the compiled artifact; everything
+    else — warmup N=50, write path update_kv_cache=True — stays on the
+    eager (original) function."""
+    def shim(x, precomputed_c, precomputed_adaLN, precomputed_wr,
+             freqs_cis_slice, kv_cache_list, update_kv_cache):
+        if (not update_kv_cache
+                and kv_cache_list is not None
+                and x.shape[1] == _AOTI_STEADY_N):
+            scale_shift_alpha, t_embed, final_adaLN = precomputed_adaLN
+            kv_cache_flat = []
+            for self_kv, cross_kv in kv_cache_list:
+                kv_cache_flat += [self_kv["k"], self_kv["v"],
+                                   cross_kv["k"], cross_kv["v"]]
+            return aoti_handle(
+                x, precomputed_c,
+                *scale_shift_alpha, t_embed, *final_adaLN,
+                precomputed_wr, freqs_cis_slice,
+                tuple(kv_cache_flat))
+        return eager_fallback(x, precomputed_c, precomputed_adaLN,
+                               precomputed_wr, freqs_cis_slice,
+                               kv_cache_list, update_kv_cache)
+    return shim
+
+
 class DataProcessor:
     def __init__(self, opt):
         self.opt = opt
@@ -160,10 +217,29 @@ class InferenceAgent:
             # with tight VRAM budgets.
             compile_mode = os.environ.get("AF_COMPILE_MODE", "reduce-overhead")
             mae_compile_mode = os.environ.get("AF_MAE_COMPILE_MODE", compile_mode)
-            print(f"> torch.compile: flow_transformer.forward_with_precomputed (mode={compile_mode}), motion_autoencoder.dec (mode={mae_compile_mode})")
-            self.G.flow_transformer.forward_with_precomputed = torch.compile(
-                self.G.flow_transformer.forward_with_precomputed,
-                mode=compile_mode, dynamic=True, fullgraph=False)
+
+            # If a prebuilt AOTInductor .pt2 is available for the current GPU,
+            # load it and use it for the steady-state hot path instead of
+            # torch.compile'ing from scratch. This cuts server startup from
+            # ~60s (full torch.compile + CUDA graph capture) to ~15s (load
+            # prebuilt .so + one-time AOTI graph warmup). Build the artifact
+            # by running `python scripts/compile_aot.py` once per GPU model.
+            # Disable with AF_AOTI=0.
+            aoti_handle = _try_load_aoti() if os.environ.get("AF_AOTI", "1") == "1" else None
+            if aoti_handle is not None:
+                print(f"> AOTInductor: using prebuilt flow_transformer.forward_with_precomputed (steady-state hot path)")
+                # AOTI was compiled with bf16 params; match it so the eager
+                # fallback (warmup N=50 and write path) uses the same dtype.
+                self.G.flow_transformer = self.G.flow_transformer.to(torch.bfloat16)
+                orig_fwd = self.G.flow_transformer.forward_with_precomputed
+                self.G.flow_transformer.forward_with_precomputed = _make_aoti_shim(aoti_handle, orig_fwd)
+            else:
+                print(f"> torch.compile: flow_transformer.forward_with_precomputed (mode={compile_mode})")
+                self.G.flow_transformer.forward_with_precomputed = torch.compile(
+                    self.G.flow_transformer.forward_with_precomputed,
+                    mode=compile_mode, dynamic=True, fullgraph=False)
+
+            print(f"> torch.compile: motion_autoencoder.dec (mode={mae_compile_mode})")
             self.G.motion_autoencoder.dec = torch.compile(
                 self.G.motion_autoencoder.dec,
                 mode=mae_compile_mode, dynamic=False, fullgraph=False)
